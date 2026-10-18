@@ -13,7 +13,7 @@ import litellm
     dependencies=["get_function_wrapper", "execute_function_wrapper"],
     key_dependencies=["OPENAI_API_KEY"]  # Ensure this key is set in your environment
 )
-def chat_with_functions(chat_history, available_function_names) -> str:
+def chat_with_functions(chat_history, available_function_names=None) -> str:
     def map_python_type_to_json(python_type: str) -> dict:
         """
         Maps Python type annotations to JSON Schema types.
@@ -58,6 +58,12 @@ def chat_with_functions(chat_history, available_function_names) -> str:
             raise ValueError("Message content must be a string.")
         chat_context.append({"role": role, "content": content})
 
+    # Only an omitted selection gets the keyless web-search defaults. Explicit
+    # lists, including an empty list, remain authoritative.
+    if available_function_names is None:
+        from babyagi.functionz.core.parallel_search import default_search_tools
+        available_function_names = default_search_tools()
+
     # Handle available_function_names input
     if isinstance(available_function_names, str):
         # Split the string by commas and strip whitespace
@@ -67,9 +73,6 @@ def chat_with_functions(chat_history, available_function_names) -> str:
         available_function_names = [name.strip() for name in available_function_names if isinstance(name, str) and name.strip()]
     else:
         raise ValueError("available_function_names must be a string or a list of strings.")
-
-    if not available_function_names:
-        raise ValueError("No valid function names provided in available_function_names.")
 
     # Fetch available functions from the database
     tools = []
@@ -109,11 +112,11 @@ def chat_with_functions(chat_history, available_function_names) -> str:
 
 
     # Call LiteLLM's completion API with the user message and available tools
+    tool_options = {"tools": tools, "tool_choice": "auto"} if tools else {}
     response = litellm.completion(
         model="gpt-4-turbo",
         messages=chat_context,
-        tools=tools,
-        tool_choice="auto"
+        **tool_options
     )
 
     # Extract the message from the response
@@ -129,11 +132,13 @@ def chat_with_functions(chat_history, available_function_names) -> str:
 
         for tool_call in tool_calls:
             function_name = tool_call['function']['name']
-            function_args = json.loads(tool_call['function']['arguments'])
             tool_call_id = tool_call['id']  # Extract the tool_call_id
 
             # Execute the function using execute_function_wrapper
             try:
+                if function_name not in available_function_names:
+                    raise ValueError(f"Function '{function_name}' is not enabled for this chat.")
+                function_args = json.loads(tool_call['function']['arguments'])
                 function_response = execute_function_wrapper(function_name, **function_args)
             except Exception as e:
                 function_response = f"Error executing function '{function_name}': {str(e)}"

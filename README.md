@@ -127,6 +127,58 @@ This approach makes function building and management easier by organizing relate
 
 ## Key Dependencies
 
+### Web search and page fetching
+
+BabyAGI preloads `parallel_search` and `parallel_fetch`, backed by
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp).
+Search uses Fast mode with no account or search API key. From this checkout,
+install the runtime requirements and package with Python 3.10 or 3.11:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install --no-deps .
+```
+
+Omit `available_function_names` to give the function-calling chat these tools:
+
+```python
+import babyagi
+
+# Configure your model provider as usual, for example OPENAI_API_KEY.
+answer = babyagi.chat_with_functions([
+    {"role": "user", "message": "Find recent Python release news and cite the sources."}
+])
+```
+
+Pass a function list to select tools explicitly, such as
+`available_function_names=["serpapi_search_v2"]` after loading and configuring that
+plugin. An explicit list is never supplemented with Parallel or replaced after
+a provider fails. Pass `available_function_names=[]` for chat without tools, or
+set `BABYAGI_WEB_SEARCH=off` to disable the omitted-list default. The dashboard
+continues to use the functions you select with its Add/Remove controls; add
+`parallel_search` or `parallel_fetch` there to enable them.
+
+You can also call the functions directly:
+
+```python
+results = babyagi.parallel_search(
+    objective="Find the latest stable Python release",
+    search_queries=["latest stable Python release"],
+)
+page = babyagi.parallel_fetch(
+    urls=["https://www.python.org/downloads/"],
+    objective="Stable Python release version",
+)
+```
+
+Results retain MCP content blocks and structured data, including source URLs
+and excerpts. Search objectives, queries and requested URLs are sent to Parallel
+when a tool runs. Requests are anonymous, use one identifier per runtime process,
+and have a 30-second total timeout. Service errors, including anonymous usage
+limits, are surfaced without retries or provider fallback. Importing BabyAGI
+only registers the tools and makes no search requests. Model credentials are
+still required for chat; direct search and fetch calls do not invoke a model.
+
 You can store `key_dependencies` directly from your code or manage them via the dashboard.
 
 **Storing Key Dependencies from Code:**
