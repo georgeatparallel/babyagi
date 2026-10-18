@@ -5,6 +5,7 @@ The model and network are scripted; no model or search credentials are needed.
 """
 
 import json
+import asyncio
 import os
 import tempfile
 import unittest
@@ -128,6 +129,164 @@ class ParallelRuntimeTests(unittest.TestCase):
         return self.babyagi.chat_with_functions([
             {"role": "user", "message": "Find Python release news and cite it."},
         ], **kwargs)
+
+    def search_model(self, **kwargs):
+        """One reused scripted model client for many actual runtime calls."""
+        if "tools" in kwargs:
+            return self.model_message([
+                self.tool_call("parallel_search", {
+                    "objective": "Find Python", "search_queries": ["Python release"],
+                    # The model cannot choose the caller's session context.
+                    "search_context": {"session_id": "model-chosen"},
+                }),
+                self.tool_call("parallel_fetch", {
+                    "urls": ["https://www.python.org/downloads/"],
+                }, "tool-2"),
+            ])
+        messages = [message for message in kwargs["messages"] if message["role"] == "tool"]
+        self.assertEqual(len(messages), 2)
+        for message in messages:
+            result = json.loads(message["content"])
+            self.assertIn("https://www.python.org/downloads/", json.dumps(result))
+        return self.model_message(content="Sources consumed.")
+
+    def session_ids(self):
+        return [request["params"]["arguments"].get("session_id")
+                for request in self.requests if request["method"] == "tools/call"]
+
+    def test_sequential_chats_followups_serialization_and_reset(self):
+        # Same runtime, model client, HTTP fixture and identical prompt text.
+        first = [{"role": "user", "message": "Python news"}]
+        second = [{"role": "user", "message": "Python news"}]
+        with self.transport(), patch("litellm.completion", side_effect=self.search_model) as model:
+            self.assertEqual(self.babyagi.chat_with_functions(first), "Sources consumed.")
+            self.babyagi.chat_with_functions(second)
+            first = json.loads(json.dumps(first))
+            first.append({"role": "user", "message": "More details"})
+            self.babyagi.chat_with_functions(first)
+            second.append({"role": "user", "message": "More details"})
+            self.babyagi.chat_with_functions(second)
+            first.clear()
+            first.append({"role": "user", "message": "Python news"})
+            self.babyagi.chat_with_functions(first)
+        ids = self.session_ids()
+        self.assertEqual(ids[0:2], [ids[0]] * 2)
+        self.assertEqual(ids[2:4], [ids[2]] * 2)
+        self.assertNotEqual(ids[0], ids[2])
+        self.assertEqual(ids[4:6], [ids[0]] * 2)
+        self.assertEqual(ids[6:8], [ids[2]] * 2)
+        self.assertEqual(ids[8:10], [ids[8]] * 2)
+        self.assertNotIn(ids[8], ids[:8])
+        self.assertNotIn("model-chosen", ids)
+        for tool in model.call_args_list[0].kwargs["tools"]:
+            self.assertNotIn("search_context", tool["function"]["parameters"]["properties"])
+
+    def test_deterministic_interleaving_keeps_conversations_isolated(self):
+        first = [{"role": "user", "message": "Conversation A"}]
+        second = [{"role": "user", "message": "Conversation B"}]
+        interleaved = False
+
+        def model(**kwargs):
+            nonlocal interleaved
+            if "tools" in kwargs and not interleaved:
+                interleaved = True
+                # B runs after A's context is created but before A's tools run.
+                self.babyagi.chat_with_functions(second)
+            return self.search_model(**kwargs)
+
+        with self.transport(), patch("litellm.completion", side_effect=model):
+            self.babyagi.chat_with_functions(first)
+            self.babyagi.chat_with_functions(second)
+            self.babyagi.chat_with_functions(first)
+        ids = self.session_ids()
+        self.assertNotEqual(ids[0], ids[2])
+        self.assertEqual(ids, [ids[0]] * 2 + [ids[2]] * 2 + [ids[0]] * 2 + [ids[2]] * 2)
+
+    def test_chat_retry_after_failure_and_cancellation_keeps_identity(self):
+        history = [{"role": "user", "message": "Python news"}]
+        calls = [self.tool_call("parallel_search", {
+            "objective": "Python", "search_queries": ["Python"],
+        })]
+        responses = [self.model_message(calls), self.model_message(content="Request failed.")]
+        with self.transport("http"), patch("litellm.completion", side_effect=responses) as model:
+            self.babyagi.chat_with_functions(history)
+            self.assertIn("401", model.call_args_list[-1].kwargs["messages"][-1]["content"])
+        original = self.session_ids()[0]
+
+        def cancel_after_tools(**kwargs):
+            if "tools" not in kwargs:
+                raise asyncio.CancelledError("Caller cancelled before the final answer")
+            return self.search_model(**kwargs)
+
+        with self.transport(), patch("litellm.completion", side_effect=cancel_after_tools):
+            with self.assertRaises(asyncio.CancelledError):
+                self.babyagi.chat_with_functions(history)
+        with self.transport(), patch("litellm.completion", side_effect=self.search_model):
+            self.babyagi.chat_with_functions(history)
+            self.assertEqual(self.session_ids(), [original] * 5)
+            self.babyagi.chat_with_functions([{"role": "user", "message": "Python news"}])
+        self.assertNotEqual(self.session_ids()[-1], original)
+
+    def test_context_exists_before_model_failure_and_empty_chat_continues(self):
+        history = []
+        with patch("litellm.completion", side_effect=asyncio.CancelledError()):
+            with self.assertRaises(asyncio.CancelledError):
+                self.babyagi.chat_with_functions(history)
+        original = history[0]["parallel_search_context"]["session_id"]
+        with self.transport(), patch("litellm.completion", side_effect=self.search_model) as model:
+            self.babyagi.chat_with_functions(history)
+            self.babyagi.chat_with_functions(history)
+        self.assertEqual(self.session_ids(), [original] * 4)
+        for call in model.call_args_list:
+            system_messages = [m for m in call.kwargs["messages"] if m["role"] == "system"]
+            self.assertEqual(system_messages, [{"role": "system", "content": "You are a helpful assistant."}])
+
+    def test_explicit_context_connects_chat_and_direct_research_calls(self):
+        context = {}
+        history = []
+        with self.transport(), patch("litellm.completion", side_effect=self.search_model):
+            self.babyagi.chat_with_functions(history, search_context=context)
+            self.babyagi.parallel_fetch(["https://www.python.org/downloads/"], search_context=context)
+            self.babyagi.parallel_search("Python", ["Python"], search_context=context)
+            copied = json.loads(json.dumps(context))
+            self.babyagi.chat_with_functions([], search_context=copied)
+            self.babyagi.chat_with_functions(history)
+            original = context["session_id"]
+            self.assertEqual(self.session_ids(), [original] * 8)
+            # Explicitly new run, even with an existing history/runtime.
+            self.babyagi.chat_with_functions([], search_context={})
+        self.assertNotEqual(self.session_ids()[-1], original)
+
+    def test_direct_context_retry_and_unscoped_calls(self):
+        context = {}
+        with self.transport("http"), self.assertRaisesRegex(RuntimeError, "401"):
+            self.babyagi.parallel_search("Python", ["Python"], search_context=context)
+        original = context["session_id"]
+        with self.transport():
+            self.babyagi.parallel_search("Python", ["Python"], search_context=context)
+            self.babyagi.parallel_fetch(["https://www.python.org/downloads/"], search_context=context)
+            self.babyagi.parallel_search("Independent", ["Independent"])
+            self.babyagi.parallel_fetch(["https://www.python.org/downloads/"])
+            self.babyagi.parallel_search("New run", ["New run"], search_context={})
+        self.assertEqual(self.session_ids()[:3], [original] * 3)
+        self.assertEqual(self.session_ids()[3:5], [None, None])
+        for request in self.requests:
+            if request["method"] == "tools/call" and request["params"]["arguments"].get("session_id") is None:
+                self.assertNotIn("session_id", request["params"]["arguments"])
+        self.assertNotEqual(self.session_ids()[-1], original)
+        interrupted_run = {}
+        with self.transport("timeout"), self.assertRaises(TimeoutError):
+            self.parallel.call_parallel("web_search", {
+                "objective": "Python", "search_queries": ["Python"],
+            }, timeout=0.05, search_context=interrupted_run)
+        with self.transport():
+            self.babyagi.parallel_fetch(["https://www.python.org/downloads/"], search_context=interrupted_run)
+        self.assertEqual(self.session_ids()[-2:], [interrupted_run["session_id"]] * 2)
+        for invalid in ([], {"session_id": ""}, {"session_id": "x" * 101}, {"session_id": None}):
+            with self.subTest(context=invalid), patch.object(self.parallel, "_call_async") as network:
+                with self.assertRaises(ValueError):
+                    self.babyagi.parallel_search("Python", ["Python"], search_context=invalid)
+                network.assert_not_called()
 
     def test_default_chat_dispatches_search_fetch_and_consumes_sources(self):
         calls = [

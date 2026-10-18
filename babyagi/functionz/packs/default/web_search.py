@@ -3,7 +3,7 @@
         "description": "Search the web with Parallel for current information and source URLs. No search API key is required."
     }
 )
-def parallel_search(objective: str, search_queries: list) -> dict:
+def parallel_search(objective: str, search_queries: list, search_context: dict = None) -> dict:
     """Search using one focused objective and related keyword queries."""
     from babyagi.functionz.core.parallel_search import call_parallel
 
@@ -14,7 +14,7 @@ def parallel_search(objective: str, search_queries: list) -> dict:
         raise ValueError("search_queries must be a nonempty list of strings.")
     return call_parallel("web_search", {
         "objective": objective, "search_queries": search_queries,
-    })
+    }, search_context=search_context)
 
 
 @func.register_function(
@@ -22,7 +22,7 @@ def parallel_search(objective: str, search_queries: list) -> dict:
         "description": "Fetch relevant page excerpts from HTTP or HTTPS URLs with Parallel. No search API key is required."
     }
 )
-def parallel_fetch(urls: list, objective: str = "") -> dict:
+def parallel_fetch(urls: list, objective: str = "", search_context: dict = None) -> dict:
     """Fetch up to 20 URLs; optionally focus excerpts with a short objective."""
     from urllib.parse import urlsplit
     from babyagi.functionz.core.parallel_search import call_parallel
@@ -41,4 +41,4 @@ def parallel_fetch(urls: list, objective: str = "") -> dict:
     arguments = {"urls": urls}
     if objective:
         arguments["objective"] = objective
-    return call_parallel("web_fetch", arguments)
+    return call_parallel("web_fetch", arguments, search_context=search_context)

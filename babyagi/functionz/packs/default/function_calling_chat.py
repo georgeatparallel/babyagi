@@ -13,7 +13,7 @@ import litellm
     dependencies=["get_function_wrapper", "execute_function_wrapper"],
     key_dependencies=["OPENAI_API_KEY"]  # Ensure this key is set in your environment
 )
-def chat_with_functions(chat_history, available_function_names=None) -> str:
+def chat_with_functions(chat_history, available_function_names=None, search_context: dict = None) -> str:
     def map_python_type_to_json(python_type: str) -> dict:
         """
         Maps Python type annotations to JSON Schema types.
@@ -56,6 +56,9 @@ def chat_with_functions(chat_history, available_function_names=None) -> str:
             raise ValueError("Message role must be 'user', 'assistant', or 'system'.")
         if not isinstance(content, str):
             raise ValueError("Message content must be a string.")
+        if (message.get('_parallel_search_context_only') is True
+                and role == 'system' and content == ''):
+            continue  # Empty-history context metadata is not a model message.
         chat_context.append({"role": role, "content": content})
 
     # Only an omitted selection gets the keyless web-search defaults. Explicit
@@ -73,6 +76,22 @@ def chat_with_functions(chat_history, available_function_names=None) -> str:
         available_function_names = [name.strip() for name in available_function_names if isinstance(name, str) and name.strip()]
     else:
         raise ValueError("available_function_names must be a string or a list of strings.")
+
+    # Identity belongs to this conversation, never the runtime or model client.
+    # Persist it before model/network work so failures and retries keep it too.
+    # The first history message carries metadata across calls/serialization.
+    if any(name in available_function_names for name in ("parallel_search", "parallel_fetch")):
+        from babyagi.functionz.core.parallel_search import search_session_id
+        if not chat_history:
+            # A metadata-only anchor for an initially empty conversation.
+            chat_history.append({
+                "role": "system", "message": "", "parallel_search_context": {},
+                "_parallel_search_context_only": True,
+            })
+        if search_context is None:
+            search_context = chat_history[0].setdefault("parallel_search_context", {})
+        search_session_id(search_context)
+        chat_history[0]['parallel_search_context'] = search_context
 
     # Fetch available functions from the database
     tools = []
@@ -96,6 +115,8 @@ def chat_with_functions(chat_history, available_function_names=None) -> str:
 
             # Map input_parameters to the tool's parameters
             for param in function_data.get('input_parameters', []):
+                if func_name in ("parallel_search", "parallel_fetch") and param['name'] == 'search_context':
+                    continue  # Caller-owned context is never a model argument.
                 # Convert Python types to JSON Schema types
                 json_schema = map_python_type_to_json(param['type'])
                 tool['function']['parameters']['properties'][param['name']] = {
@@ -139,6 +160,8 @@ def chat_with_functions(chat_history, available_function_names=None) -> str:
                 if function_name not in available_function_names:
                     raise ValueError(f"Function '{function_name}' is not enabled for this chat.")
                 function_args = json.loads(tool_call['function']['arguments'])
+                if function_name in ("parallel_search", "parallel_fetch"):
+                    function_args['search_context'] = search_context
                 function_response = execute_function_wrapper(function_name, **function_args)
             except Exception as e:
                 function_response = f"Error executing function '{function_name}': {str(e)}"

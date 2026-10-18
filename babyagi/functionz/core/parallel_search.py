@@ -11,10 +11,26 @@ from mcp.client.streamable_http import streamable_http_client
 
 MCP_URL = "https://search.parallel.ai/mcp"
 USER_AGENT = "BabyAGI (+https://github.com/yoheinakajima/babyagi)"
-# Keep one identifier across searches and fetches in this runtime. Never rotate
-# identifiers or retry requests to work around the anonymous service's limits.
-SESSION_ID = str(uuid.uuid4())
 DEFAULT_TOOLS = ("parallel_search", "parallel_fetch")
+
+
+def search_session_id(context):
+    """Keep optional MCP identity in caller-owned, JSON-serializable run state.
+
+    Reuse the dictionary for related calls, including retries after failures or
+    cancellation. A new dictionary starts an independent run. No client or
+    process cache owns this identity; callers without context omit it.
+    """
+    if context is None:
+        return None
+    if not isinstance(context, dict):
+        raise ValueError("search_context must be a dictionary.")
+    if "session_id" not in context:
+        context.setdefault("session_id", str(uuid.uuid4()))
+    session_id = context["session_id"]
+    if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 100:
+        raise ValueError("search_context.session_id must be a nonempty string of at most 100 characters.")
+    return session_id
 
 
 def default_search_tools():
@@ -65,7 +81,7 @@ async def _call_async(tool_name, arguments, timeout):
         raise RuntimeError(f"Parallel MCP request failed: {_error_text(error)}") from error
 
 
-def call_parallel(tool_name, arguments, timeout=30):
+def call_parallel(tool_name, arguments, timeout=30, search_context=None):
     """Run the HTTP MCP client from the synchronous function executor.
 
     No search credentials are read from the environment or function database.
@@ -75,5 +91,8 @@ def call_parallel(tool_name, arguments, timeout=30):
     """
     if tool_name not in ("web_search", "web_fetch"):
         raise ValueError("Unsupported Parallel MCP tool.")
-    arguments = {**arguments, "session_id": SESSION_ID}
+    arguments = dict(arguments)
+    session_id = search_session_id(search_context)
+    if session_id is not None:
+        arguments["session_id"] = session_id
     return anyio.run(_call_async, tool_name, arguments, timeout)
